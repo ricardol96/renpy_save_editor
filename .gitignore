@@ -34,3 +34,6 @@ diagnose*.py
 # Logs
 *.log
 
+# Setup scripts (local only)
+setup_git.bat
+
