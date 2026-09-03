@@ -7,11 +7,13 @@ Preserves save file integrity by patching values directly in pickle bytecode
 import sys
 import os
 import io
+import ast
 import zipfile
 import base64
 import struct
 import pickle
 import importlib
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from io import BytesIO
@@ -104,6 +106,15 @@ LONG1 = 0x8A
 LONG4 = 0x8B
 BINSTRING = 0x54
 SHORT_BINSTRING = 0x55
+BINPUT = 0x71
+LONG_BINPUT = 0x72
+BINGET = 0x68
+LONG_BINGET = 0x6A
+EMPTY_TUPLE = 0x29
+NEWOBJ = 0x81
+MARK = 0x28
+APPENDS = 0x65
+MEMOIZE = 0x94
 
 
 # ============================================================================
@@ -269,6 +280,10 @@ def _parse_value_at(data: bytes, pos: int):
         ln = data[pos + 1]
         if pos + 2 + ln <= n:
             return (data[pos + 2:pos + 2 + ln].decode('latin1', 'replace'), pos + 2 + ln, 'SHORT_BINSTRING')
+    if op == BINUNICODE and pos + 5 <= n:
+        ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+        if pos + 5 + ln <= n:
+            return (data[pos + 5:pos + 5 + ln].decode('utf-8', 'replace'), pos + 5 + ln, 'BINUNICODE')
     if op == ord('S'):
         end = data.find(b'\n', pos)
         if end != -1:
@@ -309,6 +324,113 @@ def _encode_scalar(value):
     raise ValueError(f'Unsupported type for encoding: {type(value)}')
 
 
+def _skip_memo_put(data: bytes, pos: int) -> int:
+    """Skip pickle memo-write opcodes following a value."""
+    n = len(data)
+    while pos < n:
+        op = data[pos]
+        if op == BINPUT and pos + 2 <= n:
+            pos += 2
+        elif op == LONG_BINPUT and pos + 5 <= n:
+            pos += 5
+        elif op == MEMOIZE:
+            pos += 1
+        else:
+            break
+    return pos
+
+
+def _skip_memo_get(data: bytes, pos: int) -> int:
+    """Skip one pickle memo-read opcode and return the following position."""
+    n = len(data)
+    if pos < n and data[pos] == BINGET and pos + 2 <= n:
+        return pos + 2
+    if pos < n and data[pos] == LONG_BINGET and pos + 5 <= n:
+        return pos + 5
+    return pos
+
+
+def _key_value_positions(log_bytes: bytes, key: str):
+    """Yield positions immediately after each exact pickle-encoded key."""
+    key_b = key.encode('latin1')
+    i = 0
+    n = len(log_bytes)
+
+    while i < n:
+        idx = log_bytes.find(key_b, i)
+        if idx == -1:
+            return
+
+        matched = False
+        if idx >= 2 and log_bytes[idx - 2] == SHORT_BINSTRING:
+            matched = log_bytes[idx - 1] == len(key_b)
+        elif idx >= 5 and log_bytes[idx - 5] in (BINSTRING, BINUNICODE):
+            ln = struct.unpack('<I', log_bytes[idx - 4:idx])[0]
+            matched = ln == len(key_b)
+
+        if matched:
+            yield _skip_memo_put(log_bytes, idx + len(key_b))
+
+        i = idx + 1
+
+
+def _list_item_spans(log_bytes: bytes, value_pos: int):
+    """Return scalar item spans for a Ren'Py RevertableList value.
+
+    Ren'Py serializes RevertableList values as a NEWOBJ followed by MARK,
+    the list items, APPENDS, and a state dictionary. This deliberately only
+    accepts scalar list entries so edits cannot silently rewrite nested data.
+    """
+    pos = _skip_memo_get(log_bytes, value_pos)
+    n = len(log_bytes)
+
+    if pos + 2 > n or log_bytes[pos] != EMPTY_TUPLE or log_bytes[pos + 1] != NEWOBJ:
+        raise ValueError('The value is not a supported Ren\'Py RevertableList.')
+    pos += 2
+    pos = _skip_memo_put(log_bytes, pos)
+
+    if pos >= n or log_bytes[pos] != MARK:
+        raise ValueError('The RevertableList item section could not be located.')
+    pos += 1
+
+    spans = []
+    while pos < n and log_bytes[pos] != APPENDS:
+        parsed = _parse_value_at(log_bytes, pos)
+        if parsed is None:
+            raise ValueError('The list contains a nested or unsupported value.')
+        _, end_pos, _ = parsed
+        spans.append((pos, end_pos))
+        pos = _skip_memo_put(log_bytes, end_pos)
+
+    if pos >= n or log_bytes[pos] != APPENDS:
+        raise ValueError('The RevertableList terminator could not be located.')
+    return spans
+
+
+def patch_list_variable_in_log(log_bytes, key, new_value):
+    """Patch a fixed-length scalar RevertableList in pickle bytecode."""
+    if not isinstance(new_value, list):
+        raise ValueError(f'{key} must be edited as a list.')
+    if any(not isinstance(item, (bool, int, float, str)) for item in new_value):
+        raise ValueError(f'{key} contains a nested or unsupported list item.')
+
+    found = 0
+    for value_pos in _key_value_positions(log_bytes, key):
+        found += 1
+        spans = _list_item_spans(log_bytes, value_pos)
+        if len(spans) != len(new_value):
+            raise ValueError(f'{key} must contain exactly {len(spans)} items.')
+
+        patched = log_bytes
+        for (start, end), item in reversed(list(zip(spans, new_value))):
+            patched = patched[:start] + _encode_scalar(item) + patched[end:]
+        return patched
+
+    if found == 0:
+        raise KeyError(f'Variable not found in pickle bytecode: {key}')
+    raise KeyError(f'Variable {key!r} was found but its list encoding was not recognized.')
+
+
 # ============================================================================
 # Save file operations
 # ============================================================================
@@ -326,8 +448,10 @@ def load_save_variables(save_path):
             variables = {}
             for k, v in roots.items():
                 if isinstance(k, str) and k.startswith('store.'):
-                    # Only include simple editable types
-                    if isinstance(v, (int, float, bool, str)):
+                    # Include scalar values and simple Ren'Py lists. Lists
+                    # are edited element-by-element without re-pickling the
+                    # rest of the save file.
+                    if isinstance(v, (int, float, bool, str, _RevertableList)):
                         variables[k] = v
             return variables, log
     except Exception as e:
@@ -404,26 +528,52 @@ def patch_variable_in_log(log_bytes, key, new_value):
 
 def save_modified_save(src_path, dst_path, modified_log):
     """Save modified log back to a new save file, regenerating signatures."""
-    with zipfile.ZipFile(src_path, 'r') as zin:
-        with zipfile.ZipFile(dst_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                if item.filename == 'log':
-                    # Write modified log
-                    zi = zipfile.ZipInfo(item.filename)
-                    zi.date_time = item.date_time
-                    zi.compress_type = zipfile.ZIP_DEFLATED
-                    zi.external_attr = item.external_attr
-                    zout.writestr(zi, modified_log)
-                elif item.filename == 'signatures':
-                    # Regenerate signatures for the new log
-                    sig = _signatures_for_log(modified_log)
-                    zi = zipfile.ZipInfo(item.filename)
-                    zi.date_time = item.date_time
-                    zi.compress_type = zipfile.ZIP_DEFLATED
-                    zi.external_attr = item.external_attr
-                    zout.writestr(zi, sig)
-                else:
-                    zout.writestr(item, zin.read(item.filename))
+    source_path = os.path.abspath(src_path)
+    destination_path = os.path.abspath(dst_path)
+    same_file = os.path.normcase(os.path.realpath(source_path)) == os.path.normcase(os.path.realpath(destination_path))
+    temporary_path = None
+    output_path = destination_path
+
+    # Opening the destination with mode 'w' would truncate the source if the
+    # user chooses the same filename in Save As. Write beside it first, then
+    # replace it only after the source ZIP has been fully read and closed.
+    if same_file:
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=os.path.basename(destination_path) + '.',
+            suffix='.tmp',
+            dir=os.path.dirname(destination_path) or None,
+        )
+        os.close(fd)
+        output_path = temporary_path
+
+    try:
+        with zipfile.ZipFile(source_path, 'r') as zin:
+            with zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == 'log':
+                        # Write modified log
+                        zi = zipfile.ZipInfo(item.filename)
+                        zi.date_time = item.date_time
+                        zi.compress_type = zipfile.ZIP_DEFLATED
+                        zi.external_attr = item.external_attr
+                        zout.writestr(zi, modified_log)
+                    elif item.filename == 'signatures':
+                        # Regenerate signatures for the new log
+                        sig = _signatures_for_log(modified_log)
+                        zi = zipfile.ZipInfo(item.filename)
+                        zi.date_time = item.date_time
+                        zi.compress_type = zipfile.ZIP_DEFLATED
+                        zi.external_attr = item.external_attr
+                        zout.writestr(zi, sig)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+
+        if same_file:
+            os.replace(output_path, destination_path)
+            temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 # ============================================================================
@@ -440,6 +590,8 @@ class RenpySaveEditorGUI:
         self.original_log = None
         self.variables = {}
         self.modified_variables = {}
+        self.inline_editor = None
+        self.inline_editor_key = None
         
         self.create_widgets()
     
@@ -497,13 +649,14 @@ class RenpySaveEditorGUI:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Bind double-click to edit
-        self.tree.bind('<Double-Button-1>', self.on_double_click)
+        # Edit directly in the value column. Booleans toggle on click; other
+        # supported values use an in-place entry overlay.
+        self.tree.bind('<Button-1>', self.on_tree_click)
         
         # Info label
         info_frame = ttk.Frame(self.root)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(info_frame, text="💡 Double-click a value to edit it. Only simple types (int, float, bool, str) can be edited.", 
+        ttk.Label(info_frame, text="💡 Click a value to edit it in place. Boolean values toggle directly; lists must keep their original length.",
                  foreground='blue').pack(side=tk.LEFT)
     
     def load_file(self):
@@ -531,6 +684,9 @@ class RenpySaveEditorGUI:
             messagebox.showerror("Error", f"Failed to load save file:\n{str(e)}")
     
     def populate_tree(self):
+        if self.inline_editor is not None:
+            self._cancel_inline_edit()
+
         # Clear existing items
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -543,89 +699,119 @@ class RenpySaveEditorGUI:
             
             value = self.modified_variables.get(key, self.variables[key])
             value_type = type(value).__name__
+            # Tkinter converts nested Python lists to Tcl list syntax when
+            # passed directly as a Treeview value (for example, "True True").
+            # Use Python notation so the displayed value is also valid input
+            # for the list editor: "[True, True]".
+            display_value = repr(value) if isinstance(value, (list, dict, set)) else str(value)
             
             # Highlight modified variables
             tags = ('modified',) if key in self.modified_variables else ()
             
-            self.tree.insert('', tk.END, values=(key, value, value_type), tags=tags)
+            self.tree.insert('', tk.END, values=(key, display_value, value_type), tags=tags)
         
         # Configure tag colors
         self.tree.tag_configure('modified', background='yellow')
     
     def apply_filter(self):
         self.populate_tree()
-    
-    def on_double_click(self, event):
-        selection = self.tree.selection()
-        if not selection:
-            return
-        
-        item = selection[0]
-        values = self.tree.item(item, 'values')
-        if not values:
-            return
-        
-        key, current_value, value_type = values
-        
-        # Create edit dialog. Build widgets before grab_set(): on some Linux
-        # window managers the Toplevel is not viewable yet, which raises
-        # TclError ("grab failed: window not viewable") and leaves an empty dialog.
-        # See https://github.com/ricardol96/renpy_save_editor/issues/1
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"Edit {key}")
-        dialog.geometry("500x200")
-        dialog.transient(self.root)
-        
-        ttk.Label(dialog, text=f"Variable: {key}").pack(pady=5)
-        ttk.Label(dialog, text=f"Type: {value_type}").pack(pady=5)
-        
-        ttk.Label(dialog, text="New Value:").pack(pady=5)
-        value_var = tk.StringVar(value=str(current_value))
-        entry = ttk.Entry(dialog, textvariable=value_var, width=50)
-        entry.pack(pady=5)
-        
-        def save_edit():
-            try:
-                new_value_str = value_var.get()
-                original_value = self.variables[key]
-                
-                # Parse based on original type
-                if isinstance(original_value, bool):
-                    new_value = new_value_str.lower() in ('true', '1', 'yes')
-                elif isinstance(original_value, int):
-                    new_value = int(new_value_str)
-                elif isinstance(original_value, float):
-                    new_value = float(new_value_str)
-                elif isinstance(original_value, str):
-                    new_value = new_value_str
-                else:
-                    raise ValueError(f"Unsupported type: {type(original_value)}")
-                
-                self.modified_variables[key] = new_value
-                self.populate_tree()
-                dialog.destroy()
-                self.status_var.set(f"Modified: {key} = {new_value}")
-                
-            except ValueError as e:
-                messagebox.showerror("Invalid Value", f"Could not parse value:\n{str(e)}", parent=dialog)
-        
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(pady=10)
-        ttk.Button(button_frame, text="Save", command=save_edit).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
-        
-        # Bind Enter key
-        entry.bind('<Return>', lambda e: save_edit())
 
-        dialog.update_idletasks()
-        dialog.wait_visibility()
-        dialog.grab_set()
-        entry.focus_set()
-        entry.select_range(0, tk.END)
+    def _parse_inline_value(self, original_value, text):
+        """Parse an in-place edit while preserving the original value type."""
+        if isinstance(original_value, _RevertableList):
+            new_value = ast.literal_eval(text)
+            if not isinstance(new_value, list):
+                raise ValueError('The new value must be a list.')
+            if len(new_value) != len(original_value):
+                raise ValueError(
+                    f'This list must contain exactly {len(original_value)} items.'
+                )
+            if any(not isinstance(item, (bool, int, float, str))
+                   for item in new_value):
+                raise ValueError('Nested lists and dictionaries are not supported yet.')
+            return new_value
+        if isinstance(original_value, int):
+            return int(text)
+        if isinstance(original_value, float):
+            return float(text)
+        if isinstance(original_value, str):
+            return text
+        raise ValueError(f"Unsupported type: {type(original_value)}")
+
+    def _store_modified_value(self, key, new_value):
+        """Store a value and remove the highlight if it matches the original."""
+        if new_value == self.variables[key]:
+            self.modified_variables.pop(key, None)
+        else:
+            self.modified_variables[key] = new_value
+        self.populate_tree()
+        self.status_var.set(f"Modified: {key} = {new_value}")
+
+    def _cancel_inline_edit(self):
+        if self.inline_editor is not None:
+            self.inline_editor.destroy()
+        self.inline_editor = None
+        self.inline_editor_key = None
+
+    def _commit_inline_edit(self, event=None):
+        if self.inline_editor is None:
+            return 'break'
+
+        editor = self.inline_editor
+        key = self.inline_editor_key
+        try:
+            new_value = self._parse_inline_value(self.variables[key], editor.get())
+        except (ValueError, SyntaxError) as error:
+            messagebox.showerror(
+                "Invalid Value",
+                f"Could not parse value:\n{error}",
+                parent=self.root,
+            )
+            editor.focus_set()
+            return 'break'
+
+        self._cancel_inline_edit()
+        self._store_modified_value(key, new_value)
+        return 'break'
+
+    def _start_inline_edit(self, item, key):
+        self._cancel_inline_edit()
+        bbox = self.tree.bbox(item, '#2')
+        if not bbox:
+            return
+
+        current_value = self.modified_variables.get(key, self.variables[key])
+        display_value = repr(current_value) if isinstance(current_value, list) else str(current_value)
+        x, y, width, height = bbox
+        self.inline_editor = ttk.Entry(self.tree)
+        self.inline_editor.insert(0, display_value)
+        self.inline_editor.select_range(0, tk.END)
+        self.inline_editor.place(x=x, y=y, width=width, height=height)
+        self.inline_editor_key = key
+        self.inline_editor.bind('<Return>', self._commit_inline_edit)
+        self.inline_editor.bind('<FocusOut>', self._commit_inline_edit)
+        self.inline_editor.bind('<Escape>', lambda event: self._cancel_inline_edit())
+        self.inline_editor.focus_set()
+
+    def on_tree_click(self, event):
+        row = self.tree.identify_row(event.y)
+        column = self.tree.identify_column(event.x)
+        if not row or column != '#2':
+            return
+
+        self.tree.selection_set(row)
+        key = self.tree.item(row, 'values')[0]
+        original_value = self.variables[key]
+        current_value = self.modified_variables.get(key, original_value)
+        if isinstance(original_value, bool):
+            self._store_modified_value(key, not bool(current_value))
+        else:
+            self._start_inline_edit(row, key)
+        return 'break'
     
     def save_file(self):
-        if not self.current_file or not self.modified_variables:
-            messagebox.showinfo("Info", "No modifications to save.")
+        if not self.current_file:
+            messagebox.showinfo("Info", "No save file is loaded.")
             return
         
         # Get output filename
@@ -643,15 +829,35 @@ class RenpySaveEditorGUI:
         try:
             # Apply all modifications to the log
             modified_log = self.original_log
+            modified_count = len(self.modified_variables)
             for key, value in self.modified_variables.items():
-                modified_log = patch_variable_in_log(modified_log, key, value)
+                if isinstance(self.variables[key], _RevertableList):
+                    modified_log = patch_list_variable_in_log(modified_log, key, value)
+                else:
+                    modified_log = patch_variable_in_log(modified_log, key, value)
             
             # Save to new file
             save_modified_save(self.current_file, filename, modified_log)
+
+            # Continue editing the file just written. Reloading preserves
+            # Ren'Py container types and prevents later saves from rebuilding
+            # from the older source file or reverting the chosen filename.
+            new_variables, new_log = load_save_variables(filename)
+            if not new_variables or new_log is None:
+                raise ValueError("The saved file could not be reloaded for continued editing.")
+            self.current_file = filename
+            self.original_log = new_log
+            self.variables = new_variables
+            self.modified_variables = {}
+            self.populate_tree()
             
-            messagebox.showinfo("Success", 
+            if modified_count:
+                result = f"Modified {modified_count} variable(s)."
+            else:
+                result = "No variables were changed; the save was copied unchanged."
+            messagebox.showinfo("Success",
                 f"Save file created successfully!\n\n"
-                f"Modified {len(self.modified_variables)} variable(s).\n"
+                f"{result}\n"
                 f"Saved to: {os.path.basename(filename)}")
             self.status_var.set(f"Saved: {os.path.basename(filename)}")
             

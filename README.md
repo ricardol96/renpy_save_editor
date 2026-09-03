@@ -9,7 +9,7 @@ A safe and user-friendly GUI tool for editing Ren'Py game save files. Uses bytec
 
 ✅ **Safe Editing** - Patches values directly in pickle bytecode, preserving file structure  
 ✅ **Simple GUI** - Easy-to-use interface with variable filtering  
-✅ **Type Support** - Edit integers, floats, booleans, and strings  
+✅ **Type Support** - Edit integers, floats, booleans, strings, and fixed-length simple lists
 ✅ **Signature Handling** - Regenerates save file signatures when possible  
 ✅ **Lightweight** - Only one optional dependency (ecdsa)  
 
@@ -63,7 +63,7 @@ python renpy_save_editor.py
 ### Technical Details
 
 **String Encodings Supported**: SHORT_BINSTRING, BINSTRING, BINUNICODE  
-**Value Types Editable**: int, float, bool, str  
+**Value Types Editable**: int, float, bool, str, and fixed-length lists containing those scalar types
 **Python Version**: 3.7+  
 
 ## Usage Guide
@@ -82,13 +82,17 @@ python renpy_save_editor.py
 
 1. **Browse**: Scroll through the variable list
 2. **Filter**: Use the filter box to search (e.g., type "money" to find money-related variables)
-3. **Edit**: Double-click any value to open the edit dialog
+3. **Edit**: Click a value to edit it directly in the list; click a Boolean to toggle it
 4. **Type the new value**:
    - **Integers**: `100`, `-50`
    - **Floats**: `1.5`, `99.99`
-   - **Booleans**: `true`, `false`, `1`, `0`
+   - **Booleans**: click the True/False toggle
    - **Strings**: Any text
-5. Click **Save** in the dialog
+   - **Lists**: Python notation such as `[True, False]`; the list length must not change and nested values are not supported
+5. The edited value is applied when you commit the in-place edit
+
+For in-place text edits, press **Enter** or click elsewhere to commit, or press
+**Escape** to cancel.
 
 Modified variables are highlighted in yellow.
 
@@ -99,6 +103,9 @@ Modified variables are highlighted in yellow.
 3. **Important**: Either:
    - Save with a new name (recommended for testing)
    - Backup the original save first, then overwrite it
+
+Save As can also be used to make an unchanged copy. After saving, the newly
+written filename becomes the active file for subsequent saves.
 
 ### Loading Modified Saves in Game
 
@@ -151,7 +158,8 @@ pip install -r requirements.txt
 ## Limitations
 
 - ✅ **Editable**: Simple scalar values (int, float, bool, str)
-- ❌ **Not Editable**: Complex objects, lists, dictionaries, nested structures
+- ✅ **Editable**: Ren'Py `RevertableList` values containing only scalar items, with the original length preserved
+- ❌ **Not Editable**: Dictionaries, complex objects, and nested list/dictionary structures
 - ⚠️ **Warning**: Editing game state variables may cause unexpected behavior or break game logic
 
 **Always backup your saves before editing!**
